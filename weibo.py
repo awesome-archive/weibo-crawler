@@ -2,6 +2,7 @@
 # -*- coding: UTF-8 -*-
 
 import codecs
+import copy
 import csv
 import json
 import math
@@ -10,7 +11,7 @@ import random
 import sys
 import traceback
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from time import sleep
 
 import requests
@@ -20,39 +21,78 @@ from tqdm import tqdm
 
 
 class Weibo(object):
-    def __init__(self,
-                 filter=0,
-                 since_date='1900-01-01',
-                 mongodb_write=0,
-                 mysql_write=0,
-                 pic_download=0,
-                 video_download=0):
+    def __init__(self, config):
         """Weibo类初始化"""
-        if filter != 0 and filter != 1:
-            sys.exit(u'filter值应为数字0或1,请重新输入')
-        if not self.is_date(since_date):
-            sys.exit(u'since_date值应为yyyy-mm-dd形式,请重新输入')
-        if mongodb_write != 0 and mongodb_write != 1:
-            sys.exit(u'mongodb_write值应为0或1,请重新输入')
-        if mysql_write != 0 and mysql_write != 1:
-            sys.exit(u'mysql_write值应为0或1,请重新输入')
-        if pic_download != 0 and pic_download != 1:
-            sys.exit(u'pic_download值应为数字0或1,请重新输入')
-        if video_download != 0 and video_download != 1:
-            sys.exit(u'video_download值应为0或1,请重新输入')
-        self.user_id = ''  # 用户id,如昵称为"Dear-迪丽热巴"的id为'1669879400'
-        self.filter = filter  # 取值范围为0、1,程序默认值为0,代表要爬取用户的全部微博,1代表只爬取用户的原创微博
+        self.validate_config(config)
+        self.filter = config[
+            'filter']  # 取值范围为0、1,程序默认值为0,代表要爬取用户的全部微博,1代表只爬取用户的原创微博
+        since_date = str(config['since_date'])
+        if since_date.isdigit():
+            since_date = str(date.today() - timedelta(int(since_date)))
         self.since_date = since_date  # 起始时间，即爬取发布日期从该值到现在的微博，形式为yyyy-mm-dd
-        self.mongodb_write = mongodb_write  # 值为0代表不将结果写入MongoDB数据库,1代表写入
-        self.mysql_write = mysql_write  # 值为0代表不将结果写入MySQL数据库,1代表写入
-        self.pic_download = pic_download  # 取值范围为0、1,程序默认值为0,代表不下载微博原始图片,1代表下载
-        self.video_download = video_download  # 取值范围为0、1,程序默认为0,代表不下载微博视频,1代表下载
-        self.weibo = []  # 存储爬取到的所有微博信息
+        self.write_mode = config[
+            'write_mode']  # 结果信息保存类型，为list形式，可包含csv、mongo和mysql三种类型
+        self.original_pic_download = config[
+            'original_pic_download']  # 取值范围为0、1, 0代表不下载原创微博图片,1代表下载
+        self.retweet_pic_download = config[
+            'retweet_pic_download']  # 取值范围为0、1, 0代表不下载转发微博图片,1代表下载
+        self.original_video_download = config[
+            'original_video_download']  # 取值范围为0、1, 0代表不下载原创微博视频,1代表下载
+        self.retweet_video_download = config[
+            'retweet_video_download']  # 取值范围为0、1, 0代表不下载转发微博视频,1代表下载
+        self.cookie = {'Cookie': config.get('cookie')}  # 微博cookie，可填可不填
+        self.mysql_config = config['mysql_config']  # MySQL数据库连接配置，可以不填
+        user_id_list = config['user_id_list']
+        if not isinstance(user_id_list, list):
+            if not os.path.isabs(user_id_list):
+                user_id_list = os.path.split(
+                    os.path.realpath(__file__))[0] + os.sep + user_id_list
+            user_id_list = self.get_user_list(user_id_list)
+        self.user_id_list = user_id_list  # 要爬取的微博用户的user_id列表
+        self.user_id = ''  # 用户id,如昵称为"Dear-迪丽热巴"的id为'1669879400'
         self.user = {}  # 存储目标微博用户信息
-        self.got_count = 0  # 爬取到的微博数
+        self.got_count = 0  # 存储爬取到的微博数
+        self.weibo = []  # 存储爬取到的所有微博信息
         self.weibo_id_list = []  # 存储爬取到的所有微博id
-        self.mysql_config = {
-        }  # MySQL数据库连接配置，可以不填，当使用者的mysql用户名、密码等与本程序默认值不同时，需要通过mysql_config来自定义
+
+    def validate_config(self, config):
+        """验证配置是否正确"""
+
+        # 验证filter、original_pic_download、retweet_pic_download、original_video_download、retweet_video_download
+        argument_lsit = [
+            'filter', 'original_pic_download', 'retweet_pic_download',
+            'original_video_download', 'retweet_video_download'
+        ]
+        for argument in argument_lsit:
+            if config[argument] != 0 and config[argument] != 1:
+                sys.exit(u'%s值应为0或1,请重新输入' % config[argument])
+
+        # 验证since_date
+        since_date = str(config['since_date'])
+        if (not self.is_date(since_date)) and (not since_date.isdigit()):
+            sys.exit(u'since_date值应为yyyy-mm-dd形式或整数,请重新输入')
+
+        # 验证write_mode
+        write_mode = ['csv', 'json', 'mongo', 'mysql']
+        if not isinstance(config['write_mode'], list):
+            sys.exit(u'write_mode值应为list类型')
+        for mode in config['write_mode']:
+            if mode not in write_mode:
+                sys.exit(
+                    u'%s为无效模式，请从csv、json、mongo和mysql中挑选一个或多个作为write_mode' %
+                    mode)
+
+        # 验证user_id_list
+        user_id_list = config['user_id_list']
+        if (not isinstance(user_id_list,
+                           list)) and (not user_id_list.endswith('.txt')):
+            sys.exit(u'user_id_list值应为list类型或txt文件路径')
+        if not isinstance(user_id_list, list):
+            if not os.path.isabs(user_id_list):
+                user_id_list = os.path.split(
+                    os.path.realpath(__file__))[0] + os.sep + user_id_list
+            if not os.path.isfile(user_id_list):
+                sys.exit(u'不存在%s文件' % user_id_list)
 
     def is_date(self, since_date):
         """判断日期格式是否正确"""
@@ -65,7 +105,7 @@ class Weibo(object):
     def get_json(self, params):
         """获取网页中json数据"""
         url = 'https://m.weibo.cn/api/container/getIndex?'
-        r = requests.get(url, params=params)
+        r = requests.get(url, params=params, cookies=self.cookie)
         return r.json()
 
     def get_weibo_json(self, page):
@@ -119,9 +159,9 @@ class Weibo(object):
 
     def user_to_database(self):
         """将用户信息写入数据库"""
-        if self.mysql_write:
+        if 'mysql' in self.write_mode:
             self.user_to_mysql()
-        if self.mongodb_write:
+        if 'mongo' in self.write_mode:
             self.user_to_mongodb()
 
     def get_user_info(self):
@@ -154,7 +194,7 @@ class Weibo(object):
     def get_long_weibo(self, id):
         """获取长微博"""
         url = 'https://m.weibo.cn/detail/%s' % id
-        html = requests.get(url).text
+        html = requests.get(url, cookies=self.cookie).text
         html = html[html.find('"status":'):]
         html = html[:html.rfind('"hotScheme"')]
         html = html[:html.rfind(',')]
@@ -175,11 +215,25 @@ class Weibo(object):
             pics = ''
         return pics
 
+    def get_live_photo(self, weibo_info):
+        """获取live photo中的视频url"""
+        live_photo_list = []
+        live_photo = weibo_info.get('pic_video')
+        if live_photo:
+            prefix = 'https://video.weibo.com/media/play?livephoto=//us.sinaimg.cn/'
+            for i in live_photo.split(','):
+                if len(i.split(':')) == 2:
+                    url = prefix + i.split(':')[1] + '.mov'
+                    live_photo_list.append(url)
+            return live_photo_list
+
     def get_video_url(self, weibo_info):
         """获取微博视频url"""
         video_url = ''
+        video_url_list = []
         if weibo_info.get('page_info'):
-            if weibo_info['page_info'].get('media_info'):
+            if weibo_info['page_info'].get('media_info') and weibo_info[
+                    'page_info'].get('type') == 'video':
                 media_info = weibo_info['page_info']['media_info']
                 video_url = media_info.get('mp4_720p_mp4')
                 if not video_url:
@@ -187,8 +241,15 @@ class Weibo(object):
                     if not video_url:
                         video_url = media_info.get('mp4_sd_url')
                         if not video_url:
-                            video_url = ''
-        return video_url
+                            video_url = media_info.get('stream_url_hd')
+                            if not video_url:
+                                video_url = media_info.get('stream_url')
+        if video_url:
+            video_url_list.append(video_url)
+        live_photo_list = self.get_live_photo(weibo_info)
+        if live_photo_list:
+            video_url_list += live_photo_list
+        return ';'.join(video_url_list)
 
     def download_one_file(self, url, file_path, type, weibo_id):
         """下载单个文件(图片/视频)"""
@@ -196,7 +257,7 @@ class Weibo(object):
             if not os.path.isfile(file_path):
                 s = requests.Session()
                 s.mount(url, HTTPAdapter(max_retries=5))
-                downloaded = s.get(url, timeout=(5, 10))
+                downloaded = s.get(url, cookies=self.cookie, timeout=(5, 10))
                 with open(file_path, 'wb') as f:
                     f.write(downloaded.content)
         except Exception as e:
@@ -208,39 +269,67 @@ class Weibo(object):
             print('Error: ', e)
             traceback.print_exc()
 
-    def download_files(self, type):
+    def handle_download(self, file_type, file_dir, urls, w):
+        """处理下载相关操作"""
+        file_prefix = w['created_at'][:11].replace('-', '') + '_' + str(
+            w['id'])
+        if file_type == 'img':
+            if ',' in urls:
+                url_list = urls.split(',')
+                for i, url in enumerate(url_list):
+                    file_suffix = url[url.rfind('.'):]
+                    file_name = file_prefix + '_' + str(i + 1) + file_suffix
+                    file_path = file_dir + os.sep + file_name
+                    self.download_one_file(url, file_path, file_type, w['id'])
+            else:
+                file_suffix = urls[urls.rfind('.'):]
+                file_name = file_prefix + file_suffix
+                file_path = file_dir + os.sep + file_name
+                self.download_one_file(urls, file_path, file_type, w['id'])
+        else:
+            file_suffix = '.mp4'
+            if ';' in urls:
+                url_list = urls.split(';')
+                if url_list[0].endswith('.mov'):
+                    file_suffix = '.mov'
+                for i, url in enumerate(url_list):
+                    file_name = file_prefix + '_' + str(i + 1) + file_suffix
+                    file_path = file_dir + os.sep + file_name
+                    self.download_one_file(url, file_path, file_type, w['id'])
+            else:
+                if urls.endswith('.mov'):
+                    file_suffix = '.mov'
+                file_name = file_prefix + file_suffix
+                file_path = file_dir + os.sep + file_name
+                self.download_one_file(urls, file_path, file_type, w['id'])
+
+    def download_files(self, file_type, weibo_type):
         """下载文件(图片/视频)"""
         try:
-            if type == 'img':
+            describe = ''
+            if file_type == 'img':
                 describe = u'图片'
                 key = 'pics'
             else:
                 describe = u'视频'
                 key = 'video_url'
+            if weibo_type == 'original':
+                describe = u'原创微博' + describe
+            else:
+                describe = u'转发微博' + describe
             print(u'即将进行%s下载' % describe)
-            file_dir = self.get_filepath(type)
+            file_dir = self.get_filepath(file_type)
+            file_dir = file_dir + os.sep + describe
+            if not os.path.isdir(file_dir):
+                os.makedirs(file_dir)
             for w in tqdm(self.weibo, desc='Download progress'):
-                if w[key]:
-                    file_prefix = w['created_at'][:11].replace(
-                        '-', '') + '_' + str(w['id'])
-                    if type == 'img' and ',' in w[key]:
-                        w[key] = w[key].split(',')
-                        for j, url in enumerate(w[key]):
-                            file_suffix = url[url.rfind('.'):]
-                            file_name = file_prefix + '_' + str(
-                                j + 1) + file_suffix
-                            file_path = file_dir + os.sep + file_name
-                            self.download_one_file(url, file_path, type,
-                                                   w['id'])
+                if weibo_type == 'retweet':
+                    if w.get('retweet'):
+                        w = w['retweet']
                     else:
-                        if type == 'video':
-                            file_suffix = '.mp4'
-                        else:
-                            file_suffix = w[key][w[key].rfind('.'):]
-                        file_name = file_prefix + file_suffix
-                        file_path = file_dir + os.sep + file_name
-                        self.download_one_file(w[key], file_path, type,
-                                               w['id'])
+                        continue
+                if w.get(key):
+                    self.handle_download(file_type, file_dir, w.get(key), w)
             print(u'%s下载完毕,保存路径:' % describe)
             print(file_dir)
         except Exception as e:
@@ -317,8 +406,9 @@ class Weibo(object):
     def standardize_info(self, weibo):
         """标准化信息，去除乱码"""
         for k, v in weibo.items():
-            if 'int' not in str(type(v)) and 'long' not in str(
-                    type(v)) and 'bool' not in str(type(v)):
+            if 'bool' not in str(type(v)) and 'int' not in str(
+                    type(v)) and 'list' not in str(
+                        type(v)) and 'long' not in str(type(v)):
                 weibo[k] = v.replace(u"\u200b", "").encode(
                     sys.stdout.encoding, "ignore").decode(sys.stdout.encoding)
         return weibo
@@ -342,11 +432,11 @@ class Weibo(object):
         weibo['created_at'] = weibo_info['created_at']
         weibo['source'] = weibo_info['source']
         weibo['attitudes_count'] = self.string_to_int(
-            weibo_info['attitudes_count'])
+            weibo_info.get('attitudes_count', 0))
         weibo['comments_count'] = self.string_to_int(
-            weibo_info['comments_count'])
+            weibo_info.get('comments_count', 0))
         weibo['reposts_count'] = self.string_to_int(
-            weibo_info['reposts_count'])
+            weibo_info.get('reposts_count', 0))
         weibo['topics'] = self.get_topics(selector)
         weibo['at_users'] = self.get_at_users(selector)
         return self.standardize_info(weibo)
@@ -398,10 +488,10 @@ class Weibo(object):
             weibo_info = info['mblog']
             weibo_id = weibo_info['id']
             retweeted_status = weibo_info.get('retweeted_status')
-            is_long = weibo_info['isLongText']
+            is_long = weibo_info.get('isLongText')
             if retweeted_status:  # 转发
-                retweet_id = retweeted_status['id']
-                is_long_retweet = retweeted_status['isLongText']
+                retweet_id = retweeted_status.get('id')
+                is_long_retweet = retweeted_status.get('isLongText')
                 if is_long:
                     weibo = self.get_long_weibo(weibo_id)
                     if not weibo:
@@ -465,7 +555,7 @@ class Weibo(object):
                                     'retweet' not in wb.keys()):
                                 self.weibo.append(wb)
                                 self.weibo_id_list.append(wb['id'])
-                                self.got_count = self.got_count + 1
+                                self.got_count += 1
                                 self.print_weibo(wb)
         except Exception as e:
             print("Error: ", e)
@@ -473,9 +563,21 @@ class Weibo(object):
 
     def get_page_count(self):
         """获取微博页数"""
-        weibo_count = self.user['statuses_count']
-        page_count = int(math.ceil(weibo_count / 10.0))
-        return page_count
+        try:
+            weibo_count = self.user['statuses_count']
+            page_count = int(math.ceil(weibo_count / 10.0))
+            return page_count
+        except KeyError:
+            sys.exit(u'程序出错，错误原因可能为以下两者：\n'
+                     u'1.user_id不正确；\n'
+                     u'2.此用户微博可能需要设置cookie才能爬取。\n'
+                     u'解决方案：\n'
+                     u'请参考\n'
+                     u'https://github.com/dataabc/weibo-crawler#如何获取user_id\n'
+                     u'获取正确的user_id；\n'
+                     u'或者参考\n'
+                     u'https://github.com/dataabc/weibo-crawler#3程序设置\n'
+                     u'中的“设置cookie”部分设置cookie信息')
 
     def get_write_info(self, wrote_count):
         """获取要写入的微博信息"""
@@ -553,6 +655,45 @@ class Weibo(object):
         print(u'%d条微博写入csv文件完毕,保存路径:' % self.got_count)
         print(self.get_filepath('csv'))
 
+    def update_json_data(self, data, weibo_info):
+        """更新要写入json结果文件中的数据，已经存在于json中的信息更新为最新值，不存在的信息添加到data中"""
+        data['user'] = self.user
+        if data.get('weibo'):
+            is_new = 1  # 待写入微博是否全部为新微博，即待写入微博与json中的数据不重复
+            for old in data['weibo']:
+                if weibo_info[-1]['id'] == old['id']:
+                    is_new = 0
+                    break
+            if is_new == 0:
+                for new in weibo_info:
+                    flag = 1
+                    for i, old in enumerate(data['weibo']):
+                        if new['id'] == old['id']:
+                            data['weibo'][i] = new
+                            flag = 0
+                            break
+                    if flag:
+                        data['weibo'].append(new)
+            else:
+                data['weibo'] += weibo_info
+        else:
+            data['weibo'] = weibo_info
+        return data
+
+    def write_json(self, wrote_count):
+        """将爬到的信息写入json文件"""
+        data = {}
+        path = self.get_filepath('json')
+        if os.path.isfile(path):
+            with codecs.open(path, 'r', encoding="utf-8") as f:
+                data = json.load(f)
+        weibo_info = self.weibo[wrote_count:]
+        data = self.update_json_data(data, weibo_info)
+        with codecs.open(path, 'w', encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        print(u'%d条微博写入json文件完毕,保存路径:' % self.got_count)
+        print(path)
+
     def info_to_mongodb(self, collection, info_list):
         """将爬取的信息写入MongoDB数据库"""
         try:
@@ -565,7 +706,11 @@ class Weibo(object):
             client = MongoClient()
             db = client['weibo']
             collection = db[collection]
-            for info in info_list:
+            if len(self.write_mode) > 1:
+                new_info_list = copy.deepcopy(info_list)
+            else:
+                new_info_list = info_list
+            for info in new_info_list:
                 if not collection.find_one({'id': info['id']}):
                     collection.insert_one(info)
                 else:
@@ -577,10 +722,6 @@ class Weibo(object):
         """将爬取的微博信息写入MongoDB数据库"""
         self.info_to_mongodb('weibo', self.weibo[wrote_count:])
         print(u'%d条微博写入MongoDB数据库完毕' % self.got_count)
-
-    def change_mysql_config(self, mysql_config):
-        """修改MySQL数据库连接配置"""
-        self.mysql_config = mysql_config
 
     def mysql_create(self, connection, sql):
         """创建MySQL数据库或表"""
@@ -647,7 +788,7 @@ class Weibo(object):
                 connection.close()
 
     def weibo_to_mysql(self, wrote_count):
-        """将爬取的用户信息写入MySQL数据库"""
+        """将爬取的微博信息写入MySQL数据库"""
         mysql_config = {
             'host': 'localhost',
             'port': 3306,
@@ -666,7 +807,7 @@ class Weibo(object):
                 topics varchar(200),
                 at_users varchar(200),
                 pics varchar(1000),
-                video_url varchar(300),
+                video_url varchar(1000),
                 location varchar(100),
                 created_at DATETIME,
                 source varchar(30),
@@ -679,7 +820,11 @@ class Weibo(object):
         self.mysql_create_table(mysql_config, create_table)
         weibo_list = []
         retweet_list = []
-        for w in self.weibo[wrote_count:]:
+        if len(self.write_mode) > 1:
+            info_list = copy.deepcopy(self.weibo[wrote_count:])
+        else:
+            info_list = self.weibo[wrote_count:]
+        for w in info_list:
             if 'retweet' in w:
                 w['retweet']['retweet_id'] = ''
                 retweet_list.append(w['retweet'])
@@ -696,10 +841,13 @@ class Weibo(object):
     def write_data(self, wrote_count):
         """将爬到的信息写入文件或数据库"""
         if self.got_count > wrote_count:
-            self.write_csv(wrote_count)
-            if self.mysql_write:
+            if 'csv' in self.write_mode:
+                self.write_csv(wrote_count)
+            if 'json' in self.write_mode:
+                self.write_json(wrote_count)
+            if 'mysql' in self.write_mode:
                 self.weibo_to_mysql(wrote_count)
-            if self.mongodb_write:
+            if 'mongo' in self.write_mode:
                 self.weibo_to_mongodb(wrote_count)
 
     def get_pages(self):
@@ -750,18 +898,23 @@ class Weibo(object):
         self.user_id = user_id
         self.weibo_id_list = []
 
-    def start(self, user_id_list):
+    def start(self):
         """运行爬虫"""
         try:
-            for user_id in user_id_list:
+            for user_id in self.user_id_list:
                 self.initialize_info(user_id)
                 self.get_pages()
                 print(u'信息抓取完毕')
                 print('*' * 100)
-                if self.pic_download == 1:
-                    self.download_files('img')
-                if self.video_download == 1:
-                    self.download_files('video')
+                if self.original_pic_download:
+                    self.download_files('img', 'original')
+                if self.original_video_download:
+                    self.download_files('video', 'original')
+                if not self.filter:
+                    if self.retweet_pic_download:
+                        self.download_files('img', 'retweet')
+                    if self.retweet_video_download:
+                        self.download_files('video', 'retweet')
         except Exception as e:
             print('Error: ', e)
             traceback.print_exc()
@@ -769,51 +922,18 @@ class Weibo(object):
 
 def main():
     try:
-        # 以下是程序配置信息，可以根据自己需求修改
-        filter = 1  # 值为0表示爬取全部微博（原创微博+转发微博），值为1表示只爬取原创微博
-        since_date = '2018-01-01'  # 起始时间，即爬取发布日期从该值到现在的微博，形式为yyyy-mm-dd
-        """mongodb_write值为0代表不将结果写入MongoDB数据库,1代表写入；若要写入MongoDB数据库，
-        请先安装MongoDB数据库和pymongo，pymongo安装方法为命令行运行:pip install pymongo"""
-        mongodb_write = 0
-        """mysql_write值为0代表不将结果写入MySQL数据库,1代表写入;若要写入MySQL数据库，
-        请先安装MySQL数据库和pymysql，pymysql安装方法为命令行运行:pip install pymysql"""
-        mysql_write = 0
-        pic_download = 1  # 值为0代表不下载微博原始图片,1代表下载微博原始图片
-        video_download = 1  # 值为0代表不下载微博视频,1代表下载微博视频
-
-        wb = Weibo(filter, since_date, mongodb_write, mysql_write,
-                   pic_download, video_download)
-
-        # 下面是自定义MySQL数据库连接配置(可选)
-        """因为操作MySQL数据库需要用户名、密码等参数，本程序默认为:
-        mysql_config = {
-            'host': 'localhost',
-            'port': 3306,
-            'user': 'root',
-            'password': '123456',
-            'charset': 'utf8mb4'
-        }
-        大家的参数配置如果和默认值不同，可以将上面的参数值替换成自己的，
-        然后添加如下代码，使修改生效，如果你的参数和默认值相同则不需要下面的代码:
-        wb.change_mysql_config(mysql_config)"""
-
-        # 下面是配置user_id_list
-        """user_id_list包含了要爬的目标微博id，可以是一个，也可以是多个，也可以从文件中读取
-        爬单个微博，user_id_list如下所示，可以改成任意合法的用户id
-        user_id_list = ['1669879400']
-        爬多个微博，user_id_list如下所示，可以改成任意合法的用户id
-        user_id_list = ['1669879400', '1729370543']
-        也可以在文件中读取user_id_list，文件中可以包含很多user_id，
-        每个user_id占一行，也可以在user_id后面加注释，如用户昵称，user_id和注释之间必需要有空格，
-        文件名任意，类型为txt，位置位于本程序的同目录下，文件内容可以为如下形式：
-        1223178222 胡歌
-        1669879400 迪丽热巴
-        1729370543 郭碧婷
-        比如文件可以叫user_id_list.txt，读取文件中的user_id_list如下所示:
-        user_id_list = wb.get_user_list('user_id_list.txt')"""
-        user_id_list = ['1669879400']
-
-        wb.start(user_id_list)
+        config_path = os.path.split(
+            os.path.realpath(__file__))[0] + os.sep + 'config.json'
+        if not os.path.isfile(config_path):
+            sys.exit(u'当前路径：%s 不存在配置文件config.json' %
+                     (os.path.split(os.path.realpath(__file__))[0] + os.sep))
+        with open(config_path) as f:
+            config = json.loads(f.read())
+        wb = Weibo(config)
+        wb.start()  # 爬取微博信息
+    except ValueError:
+        print(u'config.json 格式不正确，请参考 '
+              u'https://github.com/dataabc/weibo-crawler#3程序设置')
     except Exception as e:
         print('Error: ', e)
         traceback.print_exc()
